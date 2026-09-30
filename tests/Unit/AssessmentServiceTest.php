@@ -8,8 +8,10 @@ use CarMoneyLab\Domain\ApplicationValidator;
 use CarMoneyLab\Domain\AssessmentService;
 use CarMoneyLab\Domain\DecisionEngine;
 use CarMoneyLab\Domain\LtvCalculator;
+use CarMoneyLab\Domain\ValidationException;
 use CarMoneyLab\Domain\VehicleAge;
 use CarMoneyLab\Domain\VinValidator;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class AssessmentServiceTest extends TestCase
@@ -26,16 +28,17 @@ final class AssessmentServiceTest extends TestCase
             new LtvCalculator(),
             new DecisionEngine($rules['ltv']),
             $age,
+            (int) $rules['vehicle']['review_mileage_km'],
         );
     }
 
     /** @return array<string,mixed> */
-    private function payload(int $amount, int $marketValue): array
+    private function payload(int $amount, int $marketValue, int $mileage = 96000): array
     {
         return [
             'vin' => 'XTA21099998765432',
             'year' => (int) date('Y') - 4,
-            'mileage' => 96000,
+            'mileage' => $mileage,
             'market_value' => $marketValue,
             'requested_amount' => $amount,
             'term_months' => 24,
@@ -68,5 +71,59 @@ final class AssessmentServiceTest extends TestCase
         self::assertSame(95.0, $result['ltv']);
         self::assertSame(DecisionEngine::REJECT, $result['decision']);
         self::assertSame(0, $result['approved_limit']);
+    }
+
+    /**
+     * @return iterable<string, array{int}>
+     */
+    public static function mileageAtOrBelowReviewThresholdProvider(): iterable
+    {
+        yield 'на единицу ниже порога 400 000' => [399999];
+        yield 'ровно на пороге 400 000' => [400000];
+    }
+
+    #[DataProvider('mileageAtOrBelowReviewThresholdProvider')]
+    public function testApprovesWhenMileageAtOrBelowReviewThreshold(int $mileage): void
+    {
+        $result = $this->service->assess($this->payload(450000, 900000, $mileage));
+
+        self::assertSame(DecisionEngine::APPROVE, $result['decision']);
+        self::assertSame(450000, $result['approved_limit']);
+    }
+
+    public function testDowngradesApproveToReviewWhenMileageAboveReviewThreshold(): void
+    {
+        $result = $this->service->assess($this->payload(450000, 900000, 400001));
+
+        self::assertSame(DecisionEngine::REVIEW, $result['decision']);
+        self::assertSame(0, $result['approved_limit']);
+    }
+
+    public function testKeepsReviewWhenMileageAboveReviewThresholdAndLtvInReviewBand(): void
+    {
+        $result = $this->service->assess($this->payload(700000, 900000, 400001));
+
+        self::assertSame(DecisionEngine::REVIEW, $result['decision']);
+    }
+
+    public function testKeepsRejectWhenMileageAboveReviewThresholdAndLtvAboveReject(): void
+    {
+        $result = $this->service->assess($this->payload(855000, 900000, 400001));
+
+        self::assertSame(DecisionEngine::REJECT, $result['decision']);
+    }
+
+    public function testRejectsEmptyStringMileageBeforeDecision(): void
+    {
+        $this->expectException(ValidationException::class);
+
+        $this->service->assess([
+            'vin' => 'XTA21099998765432',
+            'year' => (int) date('Y') - 4,
+            'mileage' => '',
+            'market_value' => 900000,
+            'requested_amount' => 450000,
+            'term_months' => 24,
+        ]);
     }
 }

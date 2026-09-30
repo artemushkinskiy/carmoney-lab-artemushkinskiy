@@ -1,31 +1,24 @@
 # Как считается решение approve / review / reject
 
-Сборка компонентов и загрузка `rules.php` — в `backend/src/AppFactory.php:27-39`; сам расчёт целиком в `backend/src/Domain/`. Точка входа — `AssessmentService::assess()` (backend/src/Domain/AssessmentService.php:28), порядок внутри:
+Сборка компонентов и загрузка `rules.php` — в `backend/src/AppFactory.php:27-40`; сам расчёт целиком в `backend/src/Domain/`. Точка входа — `AssessmentService::assess()` (backend/src/Domain/AssessmentService.php:29), порядок внутри:
 
-1. **`ApplicationValidator::validate($payload)`** (ApplicationValidator.php:24) — нормализация и валидация по `rules.php`: VIN через `VinValidator::isValid()` (ключ `vin`), год (`vehicle.min_year`, `vehicle.max_age_years`, возраст через `VehicleAge::inYears()`), пробег (`vehicle.max_mileage_km`), стоимость (> 0), сумма (`amount.min/max`), срок (`term.min_months/max_months`). Любая ошибка → `ValidationException`, до решения заявка не доходит. Возвращает нормализованный массив полей.
+1. **`ApplicationValidator::validate($payload)`** (ApplicationValidator.php:24) — нормализация и валидация по `rules.php`: VIN через `VinValidator::isValid()` (ключ `vin`), год (`vehicle.min_year`, `vehicle.max_age_years`, возраст через `VehicleAge::inYears()`), пробег — обязателен и в диапазоне `0..vehicle.max_mileage_km`, стоимость (> 0), сумма (`amount.min/max`), срок (`term.min_months/max_months`). Любая ошибка → `ValidationException`, до решения заявка не доходит. Возвращает нормализованный массив полей.
 2. **`LtvCalculator::calculate(requested_amount, market_value)`** (LtvCalculator.php:15) — LTV в процентах, округление до 2 знаков.
-3. **`DecisionEngine::decide($ltv)`** (DecisionEngine.php:30) — единственное место, где рождается решение. Пороги `ltv.approve_max = 60.0` и `ltv.review_max = 85.0` из `rules.php` переданы в конструктор (AppFactory.php:37): `$ltv < 60` → `approve`; `60 <= $ltv <= 85` → `review`; `> 85` → `reject`. Нюанс: комментарии (DecisionEngine.php:10, rules.php:39) пишут `LTV <= approve_max`, но код проверяет строгое `<` — при LTV ровно 60.0 будет `review`.
-4. **Назад в `assess()`**: `approved_limit` = запрошенная сумма при `approve`, иначе 0 (AssessmentService.php:39). Справочник `ltv_by_age` в решении и лимите не участвует — по коду это несделанная задача LOAN-12 (AssessmentService.php:11-12).
+3. **`DecisionEngine::decide($ltv)`** (DecisionEngine.php:30) — пороги `ltv.approve_max = 60.0` и `ltv.review_max = 85.0` из `rules.php` переданы в конструктор (AppFactory.php:38): `$ltv < 60` → `approve`; `60 <= $ltv <= 85` → `review`; `> 85` → `reject`. Нюанс: комментарии (DecisionEngine.php:10, rules.php:39) пишут `LTV <= approve_max`, но код проверяет строгое `<` — при LTV ровно 60.0 будет `review`.
+4. **Правило пробега в `assess()`** (AssessmentService.php:37-39) — если решение `approve` и пробег больше порога `vehicle.review_mileage_km` (rules.php:24, по умолчанию 400 000), решение понижается до `review`. Переопределение стоит до расчёта лимита, поэтому `approved_limit` становится 0 (baseline по задаче MILEAGE; открытые вопросы OQ-1/OQ-2 переданы аналитику).
+5. **Лимит в `assess()`** (AssessmentService.php:44): `approved_limit` = запрошенная сумма при `approve`, иначе 0. Справочник `ltv_by_age` в решении и лимите не участвует — по коду это несделанная задача LOAN-12 (AssessmentService.php:11-12).
 
-## Куда встанет правило «пробег > 400 000 → review»
+## Где встало правило «пробег > 400 000 → review»
 
-Решение принимает `DecisionEngine::decide()`, но она получает только `float $ltv` — пробега у неё нет. Поэтому два возможных места:
+Правило применяется в `AssessmentService::assess()` сразу после `DecisionEngine::decide($ltv)` (AssessmentService.php:37-39) — `$input['mileage']` к этому моменту уже нормализован валидатором. Условие: `$decision === APPROVE && $input['mileage'] > $this->reviewMileageKm` → `$decision = REVIEW`. На `review` и `reject` правило не действует (`review` уже `review`; `reject` не смягчается — baseline по OQ-1). Сам порог `review_mileage_km` живёт в `backend/config/rules.php:24` и передаётся в `AssessmentService` через конструктор (AppFactory.php:40), чтобы число не хардкодилось (AGENTS.md).
 
-- **`DecisionEngine::decide()`** — тогда нужно передавать mileage внутрь (менять конструктор/сигнатуру, AppFactory.php:37) и добавить порог в `rules.php`;
-- либо **`AssessmentService::assess()` сразу после строки 33** (`$decision = $this->decisionEngine->decide($ltv);`) — там `$input['mileage']` уже доступен, и решение переопределяется на `review` при превышении порога.
-
-По конвенции проекта само число 400 000 должно попасть в `backend/config/rules.php` (AGENTS.md: пороги не хардкодим).
-
-**Что уже есть:** значение пробега — оно валидируется и возвращается нормализованным (ApplicationValidator.php:43-46, 78), т.е. в `assess()` доступно как `$input['mileage']`.
-
-**Чего не хватает:**
-
-- порога 400 000 в `rules.php` — нет (есть только `max_mileage_km = 500000`, это лимит валидации, а не порог решения);
-- передачи пробега в `DecisionEngine` — нет;
-- механизма комбинирования правил решения (LTV + пробег) — нет; при конфликте (LTV-`reject` + пробег-`review`) приоритет в коде не определён — нет.
-
-Учтите: заявки с пробегом > 500 000 отбрасываются валидацией, до решения не доходят — новое правило фактически сработает в диапазоне 400 000 < пробег <= 500 000.
+**Зона действия:** заявки с пробегом > `vehicle.max_mileage_km` (500 000) отбрасываются валидацией и до правила не доходят — правило фактически сработает в диапазоне 400 000 < пробег ≤ 500 000 (это значение не менялось; см. `docs/spec/spec_MILEAGE.md` §1 «Не входит»).
 
 ## Что сейчас проверяется про пробег
 
-Единственная проверка — `ApplicationValidator::validate()`, ApplicationValidator.php:43-46: `0 <= mileage <= 500 000` (из `vehicle.max_mileage_km`, rules.php:23); нарушение → ошибка `mileage`, `ValidationException`. Далее: в LTV пробег не входит (LtvCalculator.php:15 — только сумма и стоимость), в решении не участвует (DecisionEngine.php:30 — только LTV). Других проверок пробега в `backend/src/Domain/` и `rules.php` — нет.
+Две проверки:
+
+- **`ApplicationValidator::validate()`** (ApplicationValidator.php:43-53): пробег обязателен — ключ `mileage` отсутствует, `null` или `''` → ошибка `mileage`, `ValidationException`; иначе приведение `(int)` и проверка диапазона `0..vehicle.max_mileage_km` (rules.php:23).
+- **`AssessmentService::assess()`** (AssessmentService.php:37-39): при решении `approve` и пробеге > `vehicle.review_mileage_km` (rules.php:24) решение понижается до `review`.
+
+В LTV пробег не входит (LtvCalculator.php:15 — только сумма и стоимость). Других проверок пробега в `backend/src/Domain/` и `rules.php` нет.
